@@ -80,16 +80,56 @@ async def async_setup_entry(
         # Pre-seed the ICE server config by fetching it during setup, so the frontend can collect ICE servers before the offer
         try:
             await camera.config_fetch()
-        except Exception as e:
-            # Don't block startup if the config fetch fails, but log the error
+        except Exception as err:
+            # Don't block startup, and don't log the stream-info body. It
+            # includes the signaling URL and session credentials.
+            reason = str(err)
+            if "Camera is offline" in reason:
+                detail = "offline"
+            elif "Camera is off" in reason:
+                detail = "off"
+            else:
+                detail = type(err).__name__
             _LOGGER.warning(
                 "Error fetching WebRTC session configuration for camera %s: %s",
                 camera.name,
-                e,
+                detail,
             )
 
     _LOGGER.debug("Wyze camera component setup complete")
     async_add_entities(cameras, True)
+
+
+
+def strip_h264_mode0(sdp: str) -> str:
+    """Drop H.264 payload types that advertise packetization-mode=0.
+
+    Some cameras pick the mode-0 type and then send FU-A fragments, which a
+    mode-0 depacketiser discards. Offering only mode 1 keeps the payload type
+    the browser can decode. From SecKatie/ha-wyzeapi#906.
+    """
+    mode0 = set()
+    for match in re.finditer(
+        r"a=fmtp:(\d+) ([^\r\n]*packetization-mode=0[^\r\n]*)", sdp
+    ):
+        mode0.add(match.group(1))
+    if not mode0:
+        return sdp
+    for match in re.finditer(r"a=fmtp:(\d+) apt=(\d+)", sdp):
+        if match.group(2) in mode0:
+            mode0.add(match.group(1))
+    kept = []
+    for line in sdp.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        if stripped.startswith("m=video "):
+            parts = stripped.split(" ")
+            line = " ".join(parts[:3] + [p for p in parts[3:] if p not in mode0]) + "\r\n"
+        else:
+            match = re.match(r"a=(?:rtpmap|fmtp|rtcp-fb):(\d+)[ :]", stripped)
+            if match and match.group(1) in mode0:
+                continue
+        kept.append(line)
+    return "".join(kept)
 
 
 class WyzeCamera(CameraEntity):
@@ -198,11 +238,10 @@ class WyzeCamera(CameraEntity):
 
     def _async_get_webrtc_client_configuration(self) -> WebRTCClientConfiguration:
         """Return the WebRTC client configuration for this camera, including ICE servers."""
-        # This shouldn't happen, but throw an error if we don't have a config ready yet
-        if self._cached_config is None:
-            raise HomeAssistantError("WebRTC session configuration not available yet")
-
-        config = self._cached_config
+        # Setup pre-fetch fails when a camera is off or offline. Fall back to
+        # no Wyze ICE servers instead of failing: HA adds its own, and the
+        # offer handler fetches a fresh config.
+        config = self._cached_config or {}
 
         ice_servers = []
         for server in config.get("ice_servers", []):
@@ -235,11 +274,12 @@ class WyzeCamera(CameraEntity):
 
         # Always fetch a truly fresh config so the signaling URL and ICE servers
         # are never stale — KVS signed URLs are single-use and short-lived.
+        offer_sdp = strip_h264_mode0(offer_sdp)
         config = await self._camera_service.get_stream_info(self._camera)
 
         # Update cached config with the new ICE servers
         self._cached_config = config
-        _LOGGER.debug("Fresh config for offer on camera %s: %s", self.name, config)
+        _LOGGER.debug("Fresh config for offer on camera %s is ready", self.name)
 
         self.sessions[session_id] = WyzeCameraWebRTCSession(
             session_id, self, send_message, config
