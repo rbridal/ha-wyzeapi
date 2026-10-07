@@ -16,6 +16,7 @@ from wyzeapy import Wyzeapy
 from wyzeapy.exceptions import AccessTokenError
 from wyzeapy.wyze_auth_lib import Token
 
+from .camera_update import install as install_camera_update
 from .const import (
     DOMAIN,
     CONF_CLIENT,
@@ -101,6 +102,7 @@ async def async_setup(
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Set up Wyze Home Assistant Integration from a config entry."""
 
+    install_camera_update()
     hass.data.setdefault(DOMAIN, {})
 
     key_id = config_entry.data.get(KEY_ID)
